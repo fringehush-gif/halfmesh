@@ -1053,66 +1053,107 @@ void RemeshData::TangentialSmoothing(int iterations, Mesh::Type delta)
 	// 1/L). Uniform mode keeps weight 1 (bit-identical to before).
 	const bool weightBySizing = !sizing.empty();
 
+	if (m.Empty())
+		return;
+
 	typedef WeightedAccumulator<Mesh::Vertex> LaplacianInfo;
-	std::vector<LaplacianInfo> lpis(nv);
-	std::vector<Mesh::Vertex> normals(nv);
+	std::vector<Mesh::Vertex> faceNormals(m.FSize());
 	std::vector<Mesh::Vertex> freePos(nv); // precomputed FREE2D targets
 	std::vector<uint8_t> freeOk(nv); // FREE2D Hausdorff accept flags
 	for (int iter = 0; iter < iterations; ++iter) {
-		// Single fused face pass: accumulate area-weighted vertex normals
-		// (unnormalised face normals carry the area) AND the one-ring neighbour
-		// centroid for the 2D-free vertices (was two separate face traversals).
-		//
-		// Kept serial, but NOT for determinism: a per-vertex GATHER that sums each
-		// vertex's incident-face terms in ascending-face order and replays its
-		// centroid Add()s in the scatter's exact per-vertex order is byte-identical
-		// to this scatter (the reduction order is reproduced, so it does not depend
-		// on thread count) — verified against this loop over 535 smoothing
-		// iterations (uniform/adaptive/feature paths), zero mismatches. So the
-		// frozen golden does NOT force serial execution. It stays serial because
-		// the gather measured NO net win at the shipping default: it needs a
-		// per-call incident-face/neighbour CSR (connectivity changes every outer
-		// remesh iteration, so it is rebuilt each call), whose random-access build
-		// only amortises past ~8-20 smoothing passes. At smoothIterations=5 the
-		// gather ran ~15% SLOWER on a dense UVSphere(128,192) (0.0141s vs 0.0122s
-		// smoothSeconds); it wins (1.28x) only at heavy pass counts. Serial is the
-		// faster variant at the default, so it is retained.
-		std::fill(normals.begin(), normals.end(), Mesh::Vertex::Zero());
-		std::fill(lpis.begin(), lpis.end(), LaplacianInfo(Mesh::Vertex::Zero(), 0));
-		FOREACHRAWIDX (HalfMesh::FIndex, idxFace, m.FSize()) {
-			const Mesh::Face face = m.F(idxFace);
-			const Mesh::Vertex fn = mesh.ComputeFaceNormal(face);
-			normals[face[0]] += fn;
-			normals[face[1]] += fn;
-			normals[face[2]] += fn;
-			for (HalfMesh::HIndex iHe : m.FAdjacentHalfedges(idxFace)) {
-				const Mesh::VIndex iV0 = m.HeTailVertex(iHe);
-				const Mesh::VIndex iV1 = m.HeHeadVertex(iHe);
-				if (mode[iV0] == FREE2D)
-					lpis[iV0].Add(mesh.vertices[iV1], weightBySizing ? 1.f / sizing[iV1] : 1.f);
-				if (mode[iV1] == FREE2D)
-					lpis[iV1].Add(mesh.vertices[iV0], weightBySizing ? 1.f / sizing[iV0] : 1.f);
-			}
-		}
-		// FREE2D move + Hausdorff accept is a pure Jacobi step over the frozen
-		// lpis/normals and the vertex's OWN pre-pass position — no FREE2D vertex
-		// reads another's move — so precompute them in parallel (like the projection
-		// pass). Bit-identical to the old serial update; the const BVH is safe to
-		// query concurrently. The few CREASE1D vertices read feature-neighbour
-		// positions and stay in the serial apply below.
+		// Compute each face normal once. The barrier freezes this scratch before
+		// the vertex gather; positions remain unchanged until the serial apply.
+		ParallelForPool(pool, m.FSize(), [&](std::size_t f) {
+			const Mesh::Face face = m.F(static_cast<HalfMesh::FIndex>(f));
+			faceNormals[f] = mesh.ComputeFaceNormal(face);
+		});
+		// Reproduce the serial scatter's ascending-face reduction for each vertex.
+		// Common fans fit on the stack; larger fans retain every incident face.
+		// No connectivity cache survives a pass or needs rebuilding after remesh.
 		ParallelForPool(pool, nv, [&](std::size_t i) {
 			freeOk[i] = 0;
 			if (mode[i] != FREE2D)
 				return;
-			LaplacianInfo& lpi = lpis[i];
+			constexpr std::size_t inlineFaces = 32;
+			HalfMesh::FIndex localFaces[inlineFaces];
+			std::size_t localCount = 0;
+			std::vector<HalfMesh::FIndex> overflowFaces;
+			for (HalfMesh::FIndex f : m.VAdjacentFaces(static_cast<Mesh::VIndex>(i))) {
+				if (localCount < inlineFaces) {
+					localFaces[localCount++] = f;
+				} else {
+					if (overflowFaces.empty()) {
+						overflowFaces.reserve(inlineFaces * 2);
+						overflowFaces.insert(overflowFaces.end(), localFaces, localFaces + localCount);
+					}
+					overflowFaces.push_back(f);
+				}
+			}
+			HalfMesh::FIndex* incidentFaces = overflowFaces.empty() ? localFaces : overflowFaces.data();
+			const std::size_t fanCount = overflowFaces.empty() ? localCount : overflowFaces.size();
+			std::sort(incidentFaces, incidentFaces + fanCount);
+#if HALFMESH_TRIS
+			const std::size_t count = fanCount;
+#else
+			// A polygon can contribute multiple outgoing corners at one vertex;
+			// the original scatter still visits that face only once.
+			const std::size_t count = std::unique(incidentFaces, incidentFaces + fanCount) - incidentFaces;
+#endif
+			Mesh::Vertex normal = Mesh::Vertex::Zero();
+			LaplacianInfo lpi(Mesh::Vertex::Zero(), 0);
+			for (std::size_t k = 0; k < count; ++k) {
+				const HalfMesh::FIndex idxFace = incidentFaces[k];
+				const Mesh::Face face = m.F(idxFace);
+#if HALFMESH_TRIS
+				if (k + 1 < count && incidentFaces[k + 1] == idxFace) {
+					// Repeated corners yield the same face more than once in the fan.
+					// Visit that face once and replay its original corner/edge order.
+					while (k + 1 < count && incidentFaces[k + 1] == idxFace)
+						++k;
+					for (int corner = 0; corner < 3; ++corner)
+						if (face[corner] == i)
+							normal += faceNormals[idxFace];
+					for (HalfMesh::HIndex iHe : m.FAdjacentHalfedges(idxFace)) {
+						const Mesh::VIndex iV0 = m.HeTailVertex(iHe);
+						const Mesh::VIndex iV1 = m.HeHeadVertex(iHe);
+						if (iV0 == i)
+							lpi.Add(mesh.vertices[iV1], weightBySizing ? 1.f / sizing[iV1] : 1.f);
+						if (iV1 == i)
+							lpi.Add(mesh.vertices[iV0], weightBySizing ? 1.f / sizing[iV0] : 1.f);
+					}
+				} else {
+					normal += faceNormals[idxFace];
+					// The face cycle visits corner 0's neighbours as 1,2; corner 1's
+					// as 0,2; and corner 2's as 1,0. Replay only those two Add calls.
+					const Mesh::VIndex first = face[face[1] == i ? 0 : 1];
+					const Mesh::VIndex second = face[face[2] == i ? 0 : 2];
+					lpi.Add(mesh.vertices[first], weightBySizing ? 1.f / sizing[first] : 1.f);
+					lpi.Add(mesh.vertices[second], weightBySizing ? 1.f / sizing[second] : 1.f);
+				}
+#else
+				// Preserve the original first-three-corner normal scatter even in
+				// polygon builds; centroid terms still follow the entire face cycle.
+				for (int corner = 0; corner < 3; ++corner)
+					if (face[corner] == i)
+						normal += faceNormals[idxFace];
+				for (HalfMesh::HIndex iHe : m.FAdjacentHalfedges(idxFace)) {
+					const Mesh::VIndex iV0 = m.HeTailVertex(iHe);
+					const Mesh::VIndex iV1 = m.HeHeadVertex(iHe);
+					if (iV0 == i)
+						lpi.Add(mesh.vertices[iV1], weightBySizing ? 1.f / sizing[iV1] : 1.f);
+					if (iV1 == i)
+						lpi.Add(mesh.vertices[iV0], weightBySizing ? 1.f / sizing[iV0] : 1.f);
+				}
+#endif
+			}
 			if (lpi.Empty())
 				return;
 			const Mesh::Vertex& vertex = mesh.vertices[i];
 			Mesh::Vertex u = lpi.Normalized() - vertex; // toward (weighted) neighbour centroid
 			// project the displacement onto the tangent plane (remove normal part)
-			const Mesh::Type nlen2 = normals[i].squaredNorm();
+			const Mesh::Type nlen2 = normal.squaredNorm();
 			if (nlen2 > 0) {
-				const Mesh::Vertex n = normals[i] / std::sqrt(nlen2);
+				const Mesh::Vertex n = normal / std::sqrt(nlen2);
 				u -= n * n.dot(u);
 			}
 			const Mesh::Vertex np = vertex + u * delta;
