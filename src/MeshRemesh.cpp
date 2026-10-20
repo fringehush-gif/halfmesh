@@ -1074,6 +1074,39 @@ void RemeshData::TangentialSmoothing(int iterations, Mesh::Type delta)
 			freeOk[i] = 0;
 			if (mode[i] != FREE2D)
 				return;
+#if HALFMESH_TRIS
+			// Keep the outgoing corner with its face so the common one-corner case
+			// need not reconstruct the same triangle for every incident vertex.
+			struct IncidentFace
+			{
+				HalfMesh::FIndex face;
+				HalfMesh::HIndex outgoing;
+			};
+			constexpr std::size_t inlineFaces = 32;
+			IncidentFace localFaces[inlineFaces];
+			std::size_t localCount = 0;
+			std::vector<IncidentFace> overflowFaces;
+			for (HalfMesh::HIndex h : m.VOutgoingHalfedges(static_cast<Mesh::VIndex>(i))) {
+				const HalfMesh::FIndex f = m.HeFace(h);
+				if (f == math::NO_ID)
+					continue; // VAdjacentFaces skips this boundary outgoing halfedge
+				const IncidentFace entry{f, h};
+				if (localCount < inlineFaces) {
+					localFaces[localCount++] = entry;
+				} else {
+					if (overflowFaces.empty()) {
+						overflowFaces.reserve(inlineFaces * 2);
+						overflowFaces.insert(overflowFaces.end(), localFaces, localFaces + localCount);
+					}
+					overflowFaces.push_back(entry);
+				}
+			}
+			IncidentFace* incidentFaces = overflowFaces.empty() ? localFaces : overflowFaces.data();
+			const std::size_t fanCount = overflowFaces.empty() ? localCount : overflowFaces.size();
+			std::sort(incidentFaces, incidentFaces + fanCount,
+			          [](const IncidentFace& a, const IncidentFace& b) { return a.face < b.face; });
+			const std::size_t count = fanCount;
+#else
 			constexpr std::size_t inlineFaces = 32;
 			HalfMesh::FIndex localFaces[inlineFaces];
 			std::size_t localCount = 0;
@@ -1092,9 +1125,6 @@ void RemeshData::TangentialSmoothing(int iterations, Mesh::Type delta)
 			HalfMesh::FIndex* incidentFaces = overflowFaces.empty() ? localFaces : overflowFaces.data();
 			const std::size_t fanCount = overflowFaces.empty() ? localCount : overflowFaces.size();
 			std::sort(incidentFaces, incidentFaces + fanCount);
-#if HALFMESH_TRIS
-			const std::size_t count = fanCount;
-#else
 			// A polygon can contribute multiple outgoing corners at one vertex;
 			// the original scatter still visits that face only once.
 			const std::size_t count = std::unique(incidentFaces, incidentFaces + fanCount) - incidentFaces;
@@ -1102,13 +1132,13 @@ void RemeshData::TangentialSmoothing(int iterations, Mesh::Type delta)
 			Mesh::Vertex normal = Mesh::Vertex::Zero();
 			LaplacianInfo lpi(Mesh::Vertex::Zero(), 0);
 			for (std::size_t k = 0; k < count; ++k) {
-				const HalfMesh::FIndex idxFace = incidentFaces[k];
-				const Mesh::Face face = m.F(idxFace);
 #if HALFMESH_TRIS
-				if (k + 1 < count && incidentFaces[k + 1] == idxFace) {
+				const HalfMesh::FIndex idxFace = incidentFaces[k].face;
+				if (k + 1 < count && incidentFaces[k + 1].face == idxFace) {
+					const Mesh::Face face = m.F(idxFace);
 					// Repeated corners yield the same face more than once in the fan.
 					// Visit that face once and replay its original corner/edge order.
-					while (k + 1 < count && incidentFaces[k + 1] == idxFace)
+					while (k + 1 < count && incidentFaces[k + 1].face == idxFace)
 						++k;
 					for (int corner = 0; corner < 3; ++corner)
 						if (face[corner] == i)
@@ -1125,12 +1155,18 @@ void RemeshData::TangentialSmoothing(int iterations, Mesh::Type delta)
 					normal += faceNormals[idxFace];
 					// The face cycle visits corner 0's neighbours as 1,2; corner 1's
 					// as 0,2; and corner 2's as 1,0. Replay only those two Add calls.
-					const Mesh::VIndex first = face[face[1] == i ? 0 : 1];
-					const Mesh::VIndex second = face[face[2] == i ? 0 : 2];
+					const HalfMesh::HIndex h = incidentFaces[k].outgoing;
+					const Mesh::VIndex head = m.HeHeadVertex(h);
+					const Mesh::VIndex following = m.HeHeadVertex(m.HeNext(h));
+					const bool firstCorner = h == m.FHalfedge(idxFace);
+					const Mesh::VIndex first = firstCorner ? head : following;
+					const Mesh::VIndex second = firstCorner ? following : head;
 					lpi.Add(mesh.vertices[first], weightBySizing ? 1.f / sizing[first] : 1.f);
 					lpi.Add(mesh.vertices[second], weightBySizing ? 1.f / sizing[second] : 1.f);
 				}
 #else
+				const HalfMesh::FIndex idxFace = incidentFaces[k];
+				const Mesh::Face face = m.F(idxFace);
 				// Preserve the original first-three-corner normal scatter even in
 				// polygon builds; centroid terms still follow the entire face cycle.
 				for (int corner = 0; corner < 3; ++corner)
