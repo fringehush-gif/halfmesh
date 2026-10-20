@@ -203,30 +203,39 @@ void RemeshData::TagCreaseEdges(bool /*forceTag*/)
 		                                          mesh.vertices[face[2]]);
 		qualityOk[f] = q > thQualityRadii ? uint8_t(1) : uint8_t(0);
 	});
-	FOREACHRAWIDX (HalfMesh::FIndex, idxFace, m.FSize()) {
-		if (!qualityOk[idxFace])
+	// Sweep each compact edge pair once. The even halfedge owns a face;
+	// only the odd side can be a boundary sentinel.
+	FOREACHRAWIDX (HalfMesh::EIndex, iEdge, m.ESize()) {
+		HalfMesh::HIndex iHe = m.EHalfedge(iEdge);
+		Mesh::FIndex idxFace = m.HeFace(iHe);
+		ASSERT(idxFace < m.FSize());
+		if (m.EIsBoundary(iEdge)) {
+			if (qualityOk[idxFace])
+				FaceVertexMark(idxFace * 3 + m.FVertexIth(iHe, m.F(idxFace)));
 			continue;
-		for (HalfMesh::HIndex iHe : m.FAdjacentHalfedges(idxFace)) {
-			if (m.EHeIsBoundary(iHe)) {
-				FaceVertexMark(idxFace * 3 + m.FVertexIth(iHe, m.F(idxFace)));
+		}
+		Mesh::FIndex idxFaceAdj = m.FAdjacent(iHe);
+		ASSERT(idxFaceAdj < m.FSize());
+		if (!qualityOk[idxFace]) {
+			if (!qualityOk[idxFaceAdj])
 				continue;
-			}
-			// check the value of the scalar prod to the cos of the crease threshold
-			const Mesh::FIndex idxFaceAdj = m.FAdjacent(iHe);
-			const Mesh::Vertex& normal = faceNormal[idxFace];
-			const Mesh::Vertex& adjNormal = faceNormal[idxFaceAdj];
-			const Mesh::Type normalNormSq = normal.squaredNorm() * adjNormal.squaredNorm();
-			if (normalNormSq <= 0)
-				continue;
-			const Mesh::Type cosAngle = normal.dot(adjNormal) / std::sqrt(normalNormSq);
-			const Mesh::Type cosMaxAngle = -0.98f;
-			if (cosAngle > params.thCreaseCosAngle || cosAngle < cosMaxAngle)
-				continue;
-			if (qualityOk[idxFaceAdj]) {
-				const Mesh::Face faceAdj = m.F(idxFaceAdj);
-				FaceVertexMark(idxFace * 3 + m.FVertexIth(iHe, m.F(idxFace)));
-				FaceVertexMark(idxFaceAdj * 3 + m.FVertexIth(m.HeTwin(iHe), faceAdj));
-			}
+			// Preserve the original good-face calculation for mixed-quality pairs.
+			iHe = m.HeTwin(iHe);
+			std::swap(idxFace, idxFaceAdj);
+		}
+		const Mesh::Vertex& normal = faceNormal[idxFace];
+		const Mesh::Vertex& adjNormal = faceNormal[idxFaceAdj];
+		const Mesh::Type normalNormSq = normal.squaredNorm() * adjNormal.squaredNorm();
+		if (normalNormSq <= 0)
+			continue;
+		const Mesh::Type cosAngle = normal.dot(adjNormal) / std::sqrt(normalNormSq);
+		const Mesh::Type cosMaxAngle = -0.98f;
+		if (cosAngle > params.thCreaseCosAngle || cosAngle < cosMaxAngle)
+			continue;
+		if (qualityOk[idxFaceAdj]) {
+			const Mesh::Face faceAdj = m.F(idxFaceAdj);
+			FaceVertexMark(idxFace * 3 + m.FVertexIth(iHe, m.F(idxFace)));
+			FaceVertexMark(idxFaceAdj * 3 + m.FVertexIth(m.HeTwin(iHe), faceAdj));
 		}
 	}
 }
