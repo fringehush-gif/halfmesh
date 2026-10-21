@@ -21,7 +21,7 @@ Quick index:
 | [PLY / glTF / OBJ I/O](#ply--gltf--obj-io) | `Mesh::Load` / `Mesh::Save` | `Mesh.h` | all |
 | [Repair & cleaning](#repair--cleaning) | `Mesh::RemoveDuplicateVertices`, `FixNonManifold`, … | `Mesh.h` | `Decimate.cpp` preamble |
 | [QEM decimation](#qem-decimation) | `Mesh::Simplify` | `Mesh.h` | `Decimate.cpp` |
-| [Isotropic remeshing](#isotropic-remeshing) | `Mesh::RemeshIsotropic` | `Mesh.h` | `Remesh.cpp` |
+| [Isotropic remeshing](#isotropic-remeshing) | `Mesh::RemeshIsotropic` | `Mesh.h` | `src/MeshRemesh.cpp` |
 | [Smoothing](#smoothing) | `Mesh::Smooth`, `SmoothTaubin`, `SmoothHCLaplacian` | `Mesh.h` | `Smooth.cpp` |
 | [Hole filling](#hole-filling) | `Mesh::CloseHoles`, `Mesh::RemoveVerticesAndFill` | `Mesh.h` | — |
 | [Spatial indices](#spatial-indices) | `TriangleBVH`, `TriangleKdTree` | `TriangleBVH.h`, `TriangleKDTree.h` | `TextureBakeTool.cpp` |

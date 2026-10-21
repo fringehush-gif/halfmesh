@@ -1293,5 +1293,62 @@ TEST(MeshRemesh, SizingFieldIntersectsCurvature)
 	EXPECT_EQ(refused.faces.size(), curvatureOnly);
 }
 
+// The 40-face center exceeds the remesher's 32-face inline gather capacity.
+TEST(MeshRemesh, TangentialGatherHandlesMoreThan32IncidentFaces)
+{
+	constexpr unsigned kRing = 40;
+	constexpr float kPi = 3.14159265358979323846f;
+	constexpr float kDelta = 0.2f;
+	Mesh m;
+	m.vertices.reserve(kRing + 1);
+	m.faces.reserve(kRing);
+	m.vertices.emplace_back(0.1f, 0.05f, 0.f);
+	Mesh::Vertex ringMean = Mesh::Vertex::Zero();
+	for (unsigned i = 0; i < kRing; ++i) {
+		const float theta = 2.f * kPi * static_cast<float>(i) / static_cast<float>(kRing);
+		const Mesh::Vertex point(std::cos(theta), std::sin(theta), 0.f);
+		m.vertices.push_back(point);
+		ringMean += point;
+	}
+	ringMean /= static_cast<float>(kRing);
+	for (unsigned i = 0; i < kRing; ++i)
+		m.faces.emplace_back(Mesh::Face{0u, i + 1u, (i + 1u) % kRing + 1u});
+
+	m.ListHalfEdges();
+	unsigned incidentFaces = 0;
+	for ([[maybe_unused]] Mesh::FIndex face : m.halfMesh.VAdjacentFaces(0u))
+		++incidentFaces;
+	ASSERT_EQ(incidentFaces, kRing);
+	ASSERT_FALSE(m.halfMesh.VIsBoundary(0u));
+	const Mesh::Vertex before = m.vertices[0];
+	const Mesh::Vertex expected = before + kDelta * (ringMean - before);
+
+	Mesh::RemeshParams p;
+	p.SetEdgeLength(1.f);
+	p.iterations = 1;
+	p.smoothIterations = 1;
+	p.smoothDelta = kDelta;
+	p.smoothTangential = true;
+	p.doSmooth = true;
+	p.doSplit = false;
+	p.doCollapse = false;
+	p.doFlip = false;
+	p.doProject = false;
+	p.featureCorners = false;
+	m.RemeshIsotropic(p);
+	EXPECT_TRUE(m.ValidateHalfMesh());
+
+	ASSERT_EQ(m.faces.size(), kRing);
+	ASSERT_EQ(m.vertices.size(), kRing + 1u);
+	for (const Mesh::Vertex& v : m.vertices) {
+		EXPECT_TRUE(std::isfinite(v.x()));
+		EXPECT_TRUE(std::isfinite(v.y()));
+		EXPECT_TRUE(std::isfinite(v.z()));
+	}
+	EXPECT_NEAR(m.vertices[0].x(), expected.x(), 1e-4f);
+	EXPECT_NEAR(m.vertices[0].y(), expected.y(), 1e-4f);
+	EXPECT_NEAR(m.vertices[0].z(), 0.f, 1e-6f);
+}
+
 } // namespace
 } // namespace halfmesh
