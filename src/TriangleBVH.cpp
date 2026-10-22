@@ -11,6 +11,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <cfenv>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+
+#include <BS_thread_pool.hpp>
 
 #include <halfmesh/Util/Geometry.h>
 
@@ -35,6 +43,11 @@ constexpr unsigned FORCE_MEDIAN_DEPTH = 31;
 
 // Number of SAH bins along the split axis (Wald 2007). 16 is the usual sweet spot.
 constexpr int SAH_BINS = 16;
+
+// Avoid thread creation for small trees and keep detached work coarse enough
+// to amortize queue overhead. Neither limit changes the tree's split decisions.
+constexpr uint32_t PARALLEL_BUILD_MIN = 1u << 15;
+constexpr uint32_t PARALLEL_SUBTREE_MIN = 1u << 12;
 
 // Max primitives the SAH cost termination may leave in a single leaf. When the
 // best split cost is not below the leaf cost (heavily overlapping primitives:
@@ -91,6 +104,48 @@ inline bool RayAABB(const TriangleBVH::Point& o, const TriangleBVH::Point& invDi
 
 } // namespace
 
+struct TriangleBVH::BuildState
+{
+	std::atomic<uint32_t> nextNode{1};
+	BS::light_thread_pool* pool = nullptr;
+	std::fenv_t environment;
+	std::exception_ptr error;
+	std::mutex errorMutex;
+
+	void CaptureError()
+	{
+		const std::lock_guard<std::mutex> lock(errorMutex);
+		if (!error)
+			error = std::current_exception();
+	}
+
+	template <class Fn>
+	void Submit(Fn fn)
+	{
+		pool->detach_task([this, fn = std::move(fn)] {
+			// A reused worker may have a different rounding/denormal environment.
+			// Restore it even when subdivision or a nested submission throws.
+			struct RestoreEnvironment
+			{
+				std::fenv_t previous;
+				bool valid = std::fegetenv(&previous) == 0;
+				~RestoreEnvironment()
+				{
+					if (valid)
+						std::fesetenv(&previous);
+				}
+			} restore;
+			try {
+				if (std::fesetenv(&environment) != 0)
+					throw std::runtime_error("BVH worker floating-point environment");
+				fn();
+			} catch (...) {
+				CaptureError();
+			}
+		});
+	}
+};
+
 void TriangleBVH::Build(unsigned leafSize)
 {
 	mesh.SyncFacesConst();
@@ -100,6 +155,9 @@ void TriangleBVH::Build(unsigned leafSize)
 	faceBoxes.clear();
 	bbox.setEmpty();
 
+	// Child indices and the next free index must both fit in uint32_t.
+	if (mesh.faces.size() > (uint64_t(std::numeric_limits<uint32_t>::max()) + 1) / 2)
+		throw std::length_error("BVH node index capacity");
 	const uint32_t n = static_cast<uint32_t>(mesh.faces.size());
 	if (n == 0)
 		return;
@@ -125,9 +183,35 @@ void TriangleBVH::Build(unsigned leafSize)
 		box.extend(c);
 	}
 
-	nodes.reserve(2 * n);
-	nodes.emplace_back(); // root at index 0
-	Subdivide(0, 0, n, std::max(1u, leafSize), 0);
+	BuildState state;
+	std::unique_ptr<BS::light_thread_pool> pool;
+	if (n >= PARALLEL_BUILD_MIN && std::fegetenv(&state.environment) == 0) {
+		pool = std::make_unique<BS::light_thread_pool>();
+		if (pool->get_thread_count() > 1)
+			state.pool = pool.get();
+	}
+	const size_t capacity = size_t(2) * n - 1;
+	if (state.pool) {
+		// Never change vector size/capacity while workers write nodes. The empty
+		// Node constructor avoids touching the unused tail of this upper bound.
+		nodes.resize(capacity);
+	} else {
+		nodes.reserve(capacity);
+		nodes.emplace_back(); // root at index 0
+	}
+	try {
+		Subdivide(0, 0, n, std::max(1u, leafSize), 0, state);
+	} catch (...) {
+		state.CaptureError();
+	}
+	// Only the caller waits, including when its own recursive branch failed.
+	// No task, primitive range or scratch array can outlive this barrier.
+	if (state.pool)
+		pool->wait();
+	if (state.error)
+		std::rethrow_exception(state.error);
+	if (state.pool)
+		nodes.resize(state.nextNode.load(std::memory_order_relaxed));
 
 	bbox.min() = Point(nodes[0].bmin[0], nodes[0].bmin[1], nodes[0].bmin[2]);
 	bbox.max() = Point(nodes[0].bmax[0], nodes[0].bmax[1], nodes[0].bmax[2]);
@@ -140,7 +224,7 @@ void TriangleBVH::Build(unsigned leafSize)
 }
 
 void TriangleBVH::Subdivide(uint32_t nodeIdx, uint32_t first, uint32_t count,
-                            unsigned leafSize, unsigned depth)
+                            unsigned leafSize, unsigned depth, BuildState& state)
 {
 	// AABB over this node's triangles (union of precomputed per-face boxes), plus
 	// centroid bounds. Union of face AABBs == union of all vertices, exactly.
@@ -303,9 +387,15 @@ void TriangleBVH::Subdivide(uint32_t nodeIdx, uint32_t first, uint32_t count,
 		}
 	}
 
-	const uint32_t leftChild = static_cast<uint32_t>(nodes.size());
-	nodes.emplace_back();
-	nodes.emplace_back();
+	uint32_t leftChild;
+	if (state.pool) {
+		leftChild = state.nextNode.fetch_add(2, std::memory_order_relaxed);
+		ASSERT(size_t(leftChild) + 1 < nodes.size());
+	} else {
+		leftChild = static_cast<uint32_t>(nodes.size());
+		nodes.emplace_back();
+		nodes.emplace_back();
+	}
 
 	{
 		Node& nd = nodes[nodeIdx];
@@ -314,8 +404,16 @@ void TriangleBVH::Subdivide(uint32_t nodeIdx, uint32_t first, uint32_t count,
 		nd.count = 0;
 	}
 
-	Subdivide(leftChild, first, leftCount, leafSize, depth + 1);
-	Subdivide(leftChild + 1, first + leftCount, count - leftCount, leafSize, depth + 1);
+	// Siblings partition disjoint primitive ranges; scheduling changes only
+	// node numbering, never the SAH arithmetic or either child's input order.
+	if (state.pool && leftCount >= PARALLEL_SUBTREE_MIN && count - leftCount >= PARALLEL_SUBTREE_MIN) {
+		state.Submit([this, &state, leftChild, first, leftCount, leafSize, depth] {
+			Subdivide(leftChild, first, leftCount, leafSize, depth + 1, state);
+		});
+	} else {
+		Subdivide(leftChild, first, leftCount, leafSize, depth + 1, state);
+	}
+	Subdivide(leftChild + 1, first + leftCount, count - leftCount, leafSize, depth + 1, state);
 }
 
 TriangleBVH::NearestNeighbor TriangleBVH::NearestPoint(const Point& p, Scalar maxDist,

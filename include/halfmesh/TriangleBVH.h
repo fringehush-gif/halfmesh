@@ -21,7 +21,7 @@ namespace halfmesh {
 
 // Triangle bounding-volume hierarchy.
 //
-// A flattened (array-of-nodes, depth-first, children stored as adjacent pairs)
+// A flattened (array-of-nodes, children stored as adjacent pairs)
 // BVH over the mesh triangles — a cache-friendly, SIMD-friendly alternative to
 // TriangleKdTree with the same query surface. The two are independent and both
 // correct: the BVH prunes with tight per-node AABBs (fewer triangle tests) and
@@ -102,10 +102,15 @@ class TriangleBVH
 		Scalar bmax[3];
 		uint32_t leftFirst; // internal: left child index; leaf: first prim index
 		uint32_t count; // 0 = internal, > 0 = leaf primitive count
+
+		// Build initializes every used node before any query can observe it.
+		Node() {}
 	};
 
+	struct BuildState;
+
 	void Subdivide(uint32_t nodeIdx, uint32_t first, uint32_t count, unsigned leafSize,
-	               unsigned depth);
+	               unsigned depth, BuildState& state);
 #ifdef HALFMESH_TEST_HOOKS
 	unsigned HeightRecurse(uint32_t nodeIdx) const;
 #endif

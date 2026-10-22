@@ -333,3 +333,39 @@ TEST(TriangleBVHTest, NearestPointMatchesBruteForceMeshPly)
 		EXPECT_NEAR(r.dist, b.dist, 1e-3f) << "q=" << q;
 	}
 }
+
+// More than the parallel-build threshold. Every probe lies strictly inside a
+// known triangle, so face identity and results must survive scheduling changes.
+TEST(TriangleBVHTest, LargeBuildPreservesExactQueriesAcrossSchedules)
+{
+	Mesh mesh;
+	constexpr unsigned count = 1u << 16;
+	for (unsigned i = 0; i < count; ++i) {
+		const float x = float(i % 256) * 2.f;
+		const float z = float(i / 256) * 2.f;
+		const auto base = Mesh::VIndex(mesh.vertices.size());
+		mesh.vertices.emplace_back(x, 0.f, z);
+		mesh.vertices.emplace_back(x, 0.f, z + 1.f);
+		mesh.vertices.emplace_back(x + 1.f, 0.f, z);
+		mesh.faces.emplace_back(base, base + 1, base + 2);
+	}
+	for (unsigned repeat = 0; repeat < 3; ++repeat) {
+		const TriangleBVH bvh(mesh);
+		EXPECT_LE(bvh.Height(), 64u);
+		EXPECT_LE(bvh.MaxLeafSize(), 8u);
+		for (unsigned i = 0; i < count; i += 997) {
+			const Mesh::Vertex point(float(i % 256) * 2.f + .25f, 0.f, float(i / 256) * 2.f + .25f);
+			const Mesh::Vertex origin = point + Mesh::Vertex(0.f, 2.f, 0.f);
+			const auto nearest = bvh.NearestPoint(origin);
+			ASSERT_TRUE(nearest.IsValid());
+			EXPECT_EQ(nearest.idxFace, i);
+			EXPECT_FLOAT_EQ(nearest.dist, 2.f);
+			EXPECT_EQ(nearest.nearest, point);
+			const auto hit = bvh.IntersectedPoint(Eigen::ParametrizedLine<float, 3>(origin, Mesh::Vertex(0.f, -1.f, 0.f)));
+			ASSERT_TRUE(hit.IsValid());
+			EXPECT_EQ(hit.idxFace, i);
+			EXPECT_FLOAT_EQ(hit.dist, 2.f);
+			EXPECT_EQ(hit.nearest, point);
+		}
+	}
+}
